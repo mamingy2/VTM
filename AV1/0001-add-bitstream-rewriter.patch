@@ -1,0 +1,941 @@
+From 8c231bbde9aced8cb2c2ad02db6f005cf46088ed Mon Sep 17 00:00:00 2001
+From: Wu Jianhua <jianhua.wu@intel.com>
+Date: Fri, 24 Sep 2021 16:27:12 +0800
+Subject: [PATCH] add bitstream rewriter
+
+Signed-off-by: Wu Jianhua <jianhua.wu@intel.com>
+---
+ CMakeLists.txt                |   2 +
+ av1/decoder/decodeframe.c     |   2 +-
+ av1/decoder/obu.c             |   8 +-
+ examples/aom_dependency.c     |   2 +
+ examples/aom_dependency.h     | 128 ++++++++
+ examples/bitstream_rewriter.c | 535 ++++++++++++++++++++++++++++++++++
+ examples/bitstream_rewriter.h |  81 +++++
+ examples/svc_encoder_rtc.c    |  33 ++-
+ 8 files changed, 780 insertions(+), 11 deletions(-)
+ create mode 100644 examples/aom_dependency.c
+ create mode 100644 examples/aom_dependency.h
+ create mode 100644 examples/bitstream_rewriter.c
+ create mode 100644 examples/bitstream_rewriter.h
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ae7d68d9d..4a4593d68 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -454,6 +454,8 @@ if(CONFIG_AV1_ENCODER)
+                                     $<TARGET_OBJECTS:aom_encoder_app_util>)
+ 
+     add_executable(svc_encoder_rtc "${AOM_ROOT}/examples/svc_encoder_rtc.c"
++                                   "${AOM_ROOT}/examples/bitstream_rewriter.c"
++                                   "${AOM_ROOT}/examples/aom_dependency.c"
+                                    $<TARGET_OBJECTS:aom_common_app_util>
+                                    $<TARGET_OBJECTS:aom_encoder_app_util>)
+ 
+diff --git a/av1/decoder/decodeframe.c b/av1/decoder/decodeframe.c
+index 08f81daa2..917c4beff 100644
+--- a/av1/decoder/decodeframe.c
++++ b/av1/decoder/decodeframe.c
+@@ -4420,7 +4420,7 @@ static INLINE void reset_frame_buffers(AV1_COMMON *cm) {
+ 
+ // On success, returns 0. On failure, calls aom_internal_error and does not
+ // return.
+-static int read_uncompressed_header(AV1Decoder *pbi,
++int read_uncompressed_header(AV1Decoder *pbi,
+                                     struct aom_read_bit_buffer *rb) {
+   AV1_COMMON *const cm = &pbi->common;
+   const SequenceHeader *const seq_params = cm->seq_params;
+diff --git a/av1/decoder/obu.c b/av1/decoder/obu.c
+index 6011daf8d..2b86b303f 100644
+--- a/av1/decoder/obu.c
++++ b/av1/decoder/obu.c
+@@ -100,7 +100,7 @@ static int are_seq_headers_consistent(const SequenceHeader *seq_params_old,
+ // On success, sets pbi->sequence_header_ready to 1 and returns the number of
+ // bytes read from 'rb'.
+ // On failure, sets pbi->common.error.error_code and returns 0.
+-static uint32_t read_sequence_header_obu(AV1Decoder *pbi,
++uint32_t read_sequence_header_obu(AV1Decoder *pbi,
+                                          struct aom_read_bit_buffer *rb) {
+   AV1_COMMON *const cm = &pbi->common;
+   const uint32_t saved_bit_offset = rb->bit_offset;
+@@ -273,7 +273,7 @@ static uint32_t read_sequence_header_obu(AV1Decoder *pbi,
+ // On success, returns the frame header size. On failure, calls
+ // aom_internal_error and does not return. If show existing frame,
+ // also marks the data processing to end after the frame header.
+-static uint32_t read_frame_header_obu(AV1Decoder *pbi,
++uint32_t read_frame_header_obu(AV1Decoder *pbi,
+                                       struct aom_read_bit_buffer *rb,
+                                       const uint8_t *data,
+                                       const uint8_t **p_data_end,
+@@ -289,7 +289,7 @@ static uint32_t read_frame_header_obu(AV1Decoder *pbi,
+ 
+ // On success, returns the tile group header size. On failure, calls
+ // aom_internal_error() and returns -1.
+-static int32_t read_tile_group_header(AV1Decoder *pbi,
++int32_t read_tile_group_header(AV1Decoder *pbi,
+                                       struct aom_read_bit_buffer *rb,
+                                       int *start_tile, int *end_tile,
+                                       int tile_start_implicit) {
+@@ -343,7 +343,7 @@ static int32_t read_tile_group_header(AV1Decoder *pbi,
+ 
+ // On success, returns the tile group OBU size. On failure, sets
+ // pbi->common.error.error_code and returns 0.
+-static uint32_t read_one_tile_group_obu(
++uint32_t read_one_tile_group_obu(
+     AV1Decoder *pbi, struct aom_read_bit_buffer *rb, int is_first_tg,
+     const uint8_t *data, const uint8_t *data_end, const uint8_t **p_data_end,
+     int *is_last_tg, int tile_start_implicit) {
+diff --git a/examples/aom_dependency.c b/examples/aom_dependency.c
+new file mode 100644
+index 000000000..e460d736d
+--- /dev/null
++++ b/examples/aom_dependency.c
+@@ -0,0 +1,2 @@
++#include "aom_dependency.h"
++
+diff --git a/examples/aom_dependency.h b/examples/aom_dependency.h
+new file mode 100644
+index 000000000..8736ee671
+--- /dev/null
++++ b/examples/aom_dependency.h
+@@ -0,0 +1,128 @@
++/*
++ * Copyright (c) 2018-2020, Alliance for Open Media. All rights reserved
++ *
++ * This source code is subject to the terms of the BSD 2 Clause License and
++ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
++ * was not distributed with this source code in the LICENSE file, you can
++ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
++ * Media Patent License 1.0 was not distributed with this source code in the
++ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
++ */
++
++#ifndef AOM_DEPENDENCY_H_
++#define AOM_DEPENDENCY_H_
++
++#include <stdlib.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*!\brief Algorithm return codes */
++typedef enum {
++  /*!\brief Operation completed without error */
++  AOM_CODEC_OK,
++
++  /*!\brief Unspecified error */
++  AOM_CODEC_ERROR,
++
++  /*!\brief Memory operation failed */
++  AOM_CODEC_MEM_ERROR,
++
++  /*!\brief ABI version mismatch */
++  AOM_CODEC_ABI_MISMATCH,
++
++  /*!\brief Algorithm does not have required capability */
++  AOM_CODEC_INCAPABLE,
++
++  /*!\brief The given bitstream is not supported.
++   *
++   * The bitstream was unable to be parsed at the highest level. The decoder
++   * is unable to proceed. This error \ref SHOULD be treated as fatal to the
++   * stream. */
++  AOM_CODEC_UNSUP_BITSTREAM,
++
++  /*!\brief Encoded bitstream uses an unsupported feature
++   *
++   * The decoder does not implement a feature required by the encoder. This
++   * return code should only be used for features that prevent future
++   * pictures from being properly decoded. This error \ref MAY be treated as
++   * fatal to the stream or \ref MAY be treated as fatal to the current GOP.
++   */
++  AOM_CODEC_UNSUP_FEATURE,
++
++  /*!\brief The coded data for this stream is corrupt or incomplete
++   *
++   * There was a problem decoding the current frame.  This return code
++   * should only be used for failures that prevent future pictures from
++   * being properly decoded. This error \ref MAY be treated as fatal to the
++   * stream or \ref MAY be treated as fatal to the current GOP. If decoding
++   * is continued for the current GOP, artifacts may be present.
++   */
++  AOM_CODEC_CORRUPT_FRAME,
++
++  /*!\brief An application-supplied parameter is not valid.
++   *
++   */
++  AOM_CODEC_INVALID_PARAM,
++
++  /*!\brief An iterator reached the end of list.
++   *
++   */
++  AOM_CODEC_LIST_END
++
++} aom_codec_err_t;
++
++/*!\brief OBU types. */
++typedef enum ATTRIBUTE_PACKED {
++  OBU_SEQUENCE_HEADER = 1,
++  OBU_TEMPORAL_DELIMITER = 2,
++  OBU_FRAME_HEADER = 3,
++  OBU_TILE_GROUP = 4,
++  OBU_METADATA = 5,
++  OBU_FRAME = 6,
++  OBU_REDUNDANT_FRAME_HEADER = 7,
++  OBU_TILE_LIST = 8,
++  OBU_PADDING = 15,
++} OBU_TYPE;
++
++typedef struct {
++  size_t size;  // Size (1 or 2 bytes) of the OBU header (including the
++                // optional OBU extension header) in the bitstream.
++  OBU_TYPE type;
++  int has_size_field;
++  int has_extension;  // Whether the optional OBU extension header is present.
++  // The following fields come from the OBU extension header. They are set to 0
++  // if has_extension is false.
++  int temporal_layer_id;
++  int spatial_layer_id;
++} ObuHeader;
++
++aom_codec_err_t aom_read_obu_header(uint8_t *buffer, size_t buffer_length,
++                                    size_t *consumed, ObuHeader *header,
++                                    int is_annexb);
++
++aom_codec_err_t aom_read_obu_header_and_size(const uint8_t *data,
++                                             size_t bytes_available,
++                                             int is_annexb,
++                                             ObuHeader *obu_header,
++                                             size_t *const payload_size,
++                                             size_t *const bytes_read);
++
++typedef void (*aom_rb_error_handler)(void *data);
++
++struct aom_read_bit_buffer {
++  const uint8_t *bit_buffer;
++  const uint8_t *bit_buffer_end;
++  uint32_t bit_offset;
++
++  void *error_handler_data;
++  aom_rb_error_handler error_handler;
++};
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif // AOM_DEPENDENCY_H_
+diff --git a/examples/bitstream_rewriter.c b/examples/bitstream_rewriter.c
+new file mode 100644
+index 000000000..cf6bbde89
+--- /dev/null
++++ b/examples/bitstream_rewriter.c
+@@ -0,0 +1,535 @@
++/*
++ *  Copyright (c) 2021, Alliance for Open Media. All Rights Reserved.
++ *
++ *  Use of this source code is governed by a BSD-style license
++ *  that can be found in the LICENSE file in the root of the source
++ *  tree. An additional intellectual property rights grant can be found
++ *  in the file PATENTS.  All contributing project authors may
++ *  be found in the AUTHORS file in the root of the source tree.
++ */
++
++#include "bitstream_rewriter.h"
++
++#include "aom/aom_codec.h"
++#include "av1/common/obu_util.h"
++#include "common/tools_common.h"
++#include "av1/decoder/decoder.h"
++#include "av1/decoder/decodeframe.h"
++#include "aom_dsp/bitreader_buffer.h"
++#include "av1/common/mvref_common.h"
++#include "aom_dsp/bitwriter.h"
++
++extern uint32_t read_sequence_header_obu(AV1Decoder *pbi,
++                                         struct aom_read_bit_buffer *rb);
++
++extern uint32_t read_frame_header_obu(AV1Decoder *pbi,
++                                      struct aom_read_bit_buffer *rb,
++                                      const uint8_t *data,
++                                      const uint8_t **p_data_end,
++                                      int trailing_bits_present);
++
++extern uint32_t read_one_tile_group_obu(AV1Decoder *pbi,
++                struct aom_read_bit_buffer *rb, int is_first_tg, const uint8_t *data,
++                const uint8_t *data_end, const uint8_t **p_data_end, int *is_last_tg,
++                int tile_start_implicit);
++
++extern int32_t read_tile_group_header(AV1Decoder *pbi,
++                                      struct aom_read_bit_buffer *rb,
++                                      int *start_tile, int *end_tile,
++                                      int tile_start_implicit);
++
++extern int read_uncompressed_header(AV1Decoder *pbi,
++                                    struct aom_read_bit_buffer *rb);
++
++extern uint32_t read_frame_header_obu(AV1Decoder *pbi,
++                                      struct aom_read_bit_buffer *rb,
++                                      const uint8_t *data,
++                                      const uint8_t **p_data_end,
++                                      int trailing_bits_present);
++
++
++static AOM_INLINE void *aom_mallocz(size_t size) {
++  void *ptr = aom_malloc(size);
++  if (!ptr) {
++    return ptr;
++  }
++  memset(ptr, 0, size);
++  return ptr;
++}
++
++static AOM_INLINE void rewriter_allocator(RewriterBuffer *rewriter, size_t size) {
++  if (rewriter->buf && size < rewriter->capacity) {
++    rewriter->size = size;
++    rewriter->pos = 0;
++    return;
++  } else if (rewriter->buf) {
++    aom_free(rewriter->buf);
++  }
++  rewriter->capacity = size;
++  rewriter->size = size;
++  rewriter->pos = 0;
++  rewriter->buf = (uint8_t *)aom_mallocz(rewriter->capacity);
++}
++
++static AOM_INLINE void rewriter_deallocator(RewriterBuffer *rewriter) {
++    if (rewriter->buf) {
++      aom_free(rewriter->buf);
++    }
++}
++
++static AOM_INLINE const char *stringify(int type) {
++  switch ((type)) {
++#define XX(x) case x: return #x;
++  XX(OBU_FRAME);
++  XX(OBU_FRAME_HEADER);
++  XX(OBU_PADDING);
++  XX(OBU_REDUNDANT_FRAME_HEADER);
++  XX(OBU_TEMPORAL_DELIMITER);
++  XX(OBU_TILE_GROUP);
++  XX(OBU_TILE_LIST);
++  XX(OBU_SEQUENCE_HEADER);
++#undef XX
++  default:
++    return "Unknonw";
++  }
++}
++
++#define raw_obu_validate_type(obu, intput_type) { \
++  if (!((obu)->header.type | intput_type)) { \
++    aom_free(obu); \
++    obu = NULL; \
++    return 0; \
++  } \
++}
++
++static AOM_INLINE void raw_obu_init(RawObu *obu, const uint8_t *buffer, size_t size) {
++  obu->header.size = size;
++  obu->ptr = buffer;
++  obu->size += size;
++}
++
++static AOM_INLINE RawObu ** raw_obu_array_allocator(size_t size) {
++  RawObu **obus = (RawObu **)aom_malloc(sizeof(RawObu *) * size);
++  if (!obus) {
++    return NULL;
++  }
++  memset(obus, 0, sizeof(RawObu **) * size);
++  return obus;
++}
++
++static AOM_INLINE RawObu *read_raw_obu(const uint8_t **buffer, size_t *size, int type) {
++  int status = 0;
++  size_t bytes_read = 0;
++
++  RawObu *obu = (RawObu *)aom_mallocz(sizeof(RawObu));
++  if (!obu) {
++      return NULL;
++  }
++
++  status = aom_read_obu_header_and_size(*buffer, *size, 0,
++                  &obu->header, &obu->size, &bytes_read);
++  if (status) {
++    aom_free(obu);
++    return NULL;
++  }
++  raw_obu_init(obu, *buffer, bytes_read);
++  raw_obu_validate_type(obu, type);
++  fprintf(stdout, "read obu => %s\n", stringify(obu->header.type));
++  *buffer += obu->size;
++  *size -= obu->size;
++
++  return obu;
++}
++
++int is_temporal_delimiter(uint8_t *buffer, size_t size)
++{
++  size_t consumed;
++  ObuHeader header;
++
++  const int status = aom_read_obu_header(buffer, size, &consumed, &header, 0);
++  return status ? 0 : header.type == OBU_TEMPORAL_DELIMITER;
++}
++
++int amo_raw_frame_buffer_parser(RawFrame *frame, const uint8_t *buffer, size_t size)
++{
++  int status = 0;
++  struct aom_read_bit_buffer rb;
++  AV1_COMMON *cm;
++  AV1Decoder *pbi;
++  BufferPool *pool;
++  RawObu *seq;
++  const uint8_t *p_data_ended;
++
++  frame->buffer = buffer;
++  frame->size = size;
++
++  if (!frame->pbi) {
++    pool = (BufferPool *)aom_mallocz(sizeof(BufferPool));
++    if (!pool) {
++      return AOM_REWRITER_MEM_ERROR;
++    }
++    frame->pbi = av1_decoder_create(pool);
++  }
++  pbi = frame->pbi;
++
++  while (size > 0) {
++    RawObu *obu = read_raw_obu(&buffer, &size, ~0);
++    if (obu->header.spatial_layer_id > 0) {
++      frame->need_rewrite = 1;
++    } else {
++      frame->need_rewrite = 0;
++    }
++    if (!obu) {
++        return AOM_REWRITER_MEM_ERROR;
++    }
++    if (obu->header.type == OBU_TEMPORAL_DELIMITER)
++    {
++      if (frame->td) {
++        aom_free(frame->td);
++      }
++      frame->td = obu;
++      continue;
++    }
++    if (obu->header.type == OBU_SEQUENCE_HEADER)
++    {
++      frame->seq = obu;
++      av1_init_read_bit_buffer(pbi, &rb, obu->ptr + obu->header.size, obu->ptr + obu->size);
++      read_sequence_header_obu(pbi, &rb);
++      obu->capacity = 7;
++      obu->attaches = raw_obu_array_allocator(obu->capacity);
++      if (!obu->attaches) {
++        return AOM_REWRITER_MEM_ERROR;
++      }
++      continue;
++    }
++    if (obu->header.type == OBU_FRAME_HEADER) {
++      seq = frame->seq;
++      seq->attaches[seq->active_count++] = obu;
++
++      cm = &pbi->common;
++      if (!cm->cur_frame) {
++        cm->cur_frame = (RefCntBuffer *)aom_mallocz(sizeof(RefCntBuffer));
++      }
++      av1_init_read_bit_buffer(pbi, &rb, obu->ptr + obu->header.size, obu->ptr + obu->size);
++      pbi->frame_header_size = read_frame_header_obu(pbi, &rb, NULL, &p_data_ended, 1);
++      for (int i = 0; i < REF_FRAMES; i++) {
++        cm->ref_frame_map[i] = cm->cur_frame;
++      }
++      cm->cur_frame->temporal_id = obu->header.temporal_layer_id;
++      cm->cur_frame->spatial_id = obu->header.spatial_layer_id;
++      if (cm->show_existing_frame) {
++        pbi->seen_frame_header = 0;
++        return AOM_CODEC_UNSUP_BITSTREAM;
++      }
++
++      frame->tiles = &pbi->common.tiles;
++      obu->capacity = frame->tiles->cols * frame->tiles->rows;
++      obu->attaches = raw_obu_array_allocator(obu->capacity);
++      if (!obu->attaches) {
++        return AOM_REWRITER_MEM_ERROR;
++      }
++      continue;
++    }
++    if (obu->header.type == OBU_TILE_GROUP) {
++      RawObu *frame_header = seq->attaches[seq->active_count - 1];
++      frame_header->attaches[frame_header->active_count++] = obu;
++      continue;
++    }
++    seq->attaches[seq->active_count++] = obu;
++  }
++
++  frame->index++;
++  return status;
++}
++
++#define DEBUG printf
++static AOM_INLINE void rewrite_skip(MACROBLOCKD *const xd,  aom_writer *const w, int has_left, int has_above) {
++  const int skip_txfm = 1;
++  const int ctx =  has_left + has_above;
++  FRAME_CONTEXT *ec_ctx = xd->tile_ctx;
++  DEBUG("skip ctx = %d\r\n", ctx);
++  aom_write_symbol(w, skip_txfm, ec_ctx->skip_txfm_cdfs[ctx], 2);
++}
++
++static AOM_INLINE void rewrite_is_inter(aom_writer *w, FRAME_CONTEXT *ec_ctx) {
++  DEBUG("is_inter = %d\r\n", 0);
++  aom_write_symbol(w, 1, ec_ctx->intra_inter_cdf[0], 2);
++}
++
++// This function encodes the reference frame
++static AOM_INLINE void rewrite_ref_frames(aom_writer *w, FRAME_CONTEXT *ec_ctx, int has_left, int has_above) {
++  int ctx;
++  ctx = (has_left || has_above) ? 2 : 1;
++  DEBUG("single_ref_p1 ctx = %d\r\n", ctx);
++  DEBUG("single_ref_p3 ctx = %d\r\n", ctx);
++  DEBUG("single_ref_p4 ctx = %d\r\n", ctx);
++
++  aom_write_symbol(w, 0, ec_ctx->single_ref_cdf[ctx][0], 2);
++  aom_write_symbol(w, 0, ec_ctx->single_ref_cdf[ctx][2], 2);
++  aom_write_symbol(w, 0, ec_ctx->single_ref_cdf[ctx][3], 2);
++}
++
++static AOM_INLINE void rewrite_inter_mode(aom_writer *w, FRAME_CONTEXT *ec_ctx, int has_left, int has_above){
++
++    int newmv_ctx = 0;
++    int refmv_ctx = 0;
++    int closed_matches = has_left + has_above;
++    if (closed_matches == 1) {
++      newmv_ctx = refmv_ctx = 3;
++    } else if (closed_matches != 0) {
++      newmv_ctx = refmv_ctx = 5;
++    }
++
++    DEBUG("new_mv ctx = %d\r\n", newmv_ctx);
++
++    aom_write_symbol(w, 1, ec_ctx->newmv_cdf[newmv_ctx], 2);
++
++    int zeromv_ctx = 0;
++
++    DEBUG("zero_mv ctx = %d\r\n", zeromv_ctx);
++    aom_write_symbol(w, 1, ec_ctx->zeromv_cdf[zeromv_ctx], 2);
++
++
++    DEBUG("ref_mv ctx = %d\r\n", refmv_ctx);
++    aom_write_symbol(w, 0, ec_ctx->refmv_cdf[refmv_ctx], 2);
++
++}
++
++static AOM_INLINE void rewrite_use_obmc(aom_writer *w, FRAME_CONTEXT *ec_ctx, BLOCK_SIZE bsize, int has_left, int has_above) {
++
++    if (has_left || has_above) {
++        DEBUG("obmc ctx = %d\r\n", bsize);
++        aom_write_symbol(w, 0, ec_ctx->obmc_cdf[bsize], 2);
++    }
++}
++
++static AOM_INLINE void rewrite_partition(const AV1_COMMON *const cm,
++                                       const MACROBLOCKD *const xd, int hbs,
++                                       int mi_row, int mi_col, PARTITION_TYPE p,
++                                       BLOCK_SIZE bsize, aom_writer *w) {
++  const int is_partition_point = bsize >= BLOCK_8X8;
++
++  if (!is_partition_point) return;
++
++  const int has_rows = (mi_row + hbs) < cm->mi_params.mi_rows;
++  const int has_cols = (mi_col + hbs) < cm->mi_params.mi_cols;
++  const int ctx = partition_plane_context(xd, mi_row, mi_col, bsize);
++  FRAME_CONTEXT *ec_ctx = xd->tile_ctx;
++
++  if (!has_rows && !has_cols) {
++    assert(p == PARTITION_SPLIT);
++    return;
++  }
++
++  if (has_rows && has_cols) {
++    aom_write_symbol(w, p, ec_ctx->partition_cdf[ctx],
++                     partition_cdf_length(bsize));
++  } else if (!has_rows && has_cols) {
++    assert(p == PARTITION_SPLIT || p == PARTITION_HORZ);
++    assert(bsize > BLOCK_8X8);
++    aom_cdf_prob cdf[2];
++    partition_gather_vert_alike(cdf, ec_ctx->partition_cdf[ctx], bsize);
++    aom_write_cdf(w, p == PARTITION_SPLIT, cdf, 2);
++  } else {
++    assert(has_rows && !has_cols);
++    assert(p == PARTITION_SPLIT || p == PARTITION_VERT);
++    assert(bsize > BLOCK_8X8);
++    aom_cdf_prob cdf[2];
++    partition_gather_horz_alike(cdf, ec_ctx->partition_cdf[ctx], bsize);
++    aom_write_cdf(w, p == PARTITION_SPLIT, cdf, 2);
++  }
++}
++
++static AOM_INLINE void rewrite_modes_sb(
++    AV1_COMMON *const cm, MACROBLOCKD *const xd, const TileInfo *const tile,
++    aom_writer *const w, int mi_row, int mi_col, BLOCK_SIZE bsize) {
++  const PARTITION_TYPE partition = PARTITION_NONE;
++  const BLOCK_SIZE subsize = get_partition_subsize(bsize, partition);
++  const int hbs = mi_size_wide[bsize] / 2;
++  int has_left  = mi_col > tile->mi_col_start;
++  int has_above = mi_row > tile->mi_row_start;
++
++  DEBUG("+sb\r\n");
++  rewrite_partition(cm, xd, hbs, mi_row, mi_col, partition, bsize, w);
++  rewrite_skip(xd, w, has_left, has_above);
++  rewrite_is_inter(w, xd->tile_ctx);
++  rewrite_ref_frames(w, xd->tile_ctx, has_left, has_above);
++  rewrite_inter_mode(w, xd->tile_ctx, has_left, has_above);
++  rewrite_use_obmc(w, xd->tile_ctx, bsize, has_left, has_above);
++  DEBUG("-sb\r\n");
++
++  update_ext_partition_context(xd, mi_row, mi_col, subsize, bsize, partition);
++}
++
++static AOM_INLINE void set_default_ctx(AV1_COMMON *cm, MACROBLOCKD *xd, TileInfo *tile) {
++  const int num_planes = av1_num_planes(cm);
++  if (cm->delta_q_info.delta_q_present_flag) {
++    xd->current_base_qindex = cm->quant_params.base_qindex;
++    if (cm->delta_q_info.delta_lf_present_flag) {
++      av1_reset_loop_filter_delta(xd, num_planes);
++    }
++  }
++  av1_setup_frame_contexts(cm);
++  av1_setup_skip_mode_allowed(cm);
++  av1_zero_above_context(cm, xd, tile->mi_col_start, tile->mi_col_end, tile->tile_row);
++  av1_init_above_context(&cm->above_contexts, num_planes, tile->tile_row, xd);
++
++  xd->tile_ctx = cm->default_frame_context;
++}
++
++static AOM_INLINE size_t get_total_size(RawObu *obu) {
++  size_t total = 0;
++
++  if (obu) {
++      for (size_t i = 0; i < obu->active_count; i++) {
++        total += get_total_size(obu->attaches[i]);
++      }
++    total += obu->size;
++  }
++
++  return total;
++}
++
++static AOM_INLINE void copy_to_rewriter_buffer(RewriterBuffer *rewriter, RawObu *obu) {
++  if (obu) {
++    memcpy(rewriter->buf + rewriter->pos, obu->ptr, obu->size);
++    rewriter->pos += obu->size;
++    for (size_t i = 0; i < obu->active_count; i++) {
++      copy_to_rewriter_buffer(rewriter, obu->attaches[i]);
++    }
++  }
++}
++
++static int dump_raw_frame_to_rewriter_buffer(RawFrame *frame) {
++  RewriterBuffer *rewriter;
++  size_t total_size = 0;
++  RawObu *seq = frame->seq;
++
++  for (size_t i = 0; i < seq->active_count; i++) {
++    total_size += get_total_size(seq->attaches[i]);
++  }
++
++  rewriter_allocator(&frame->rewriter, total_size);
++  rewriter = &frame->rewriter;
++  if (!rewriter->buf) {
++    return AOM_REWRITER_MEM_ERROR;
++  }
++  
++  for (size_t i = 0; i < seq->active_count; i++) {
++    copy_to_rewriter_buffer(rewriter, seq->attaches[i]);
++  } 
++
++  assert(rewriter->pos == rewriter->size && "Copy failed");
++
++  return AOM_REWRITER_OK;
++}
++
++enum {
++  REWRITE_HEADER    = 0,
++  REWRITE_EXTENSION = 1,
++  REWRITE_SIZE      = 2
++};
++
++int amo_raw_frame_buffer_rewriter(RawFrame *frame, Vector2 v) {
++  int start_tile = 0;
++  int end_tile = 0;
++  int hdr_size = 0;
++  int offset = 0;
++
++  TileInfo tile_info;
++
++  struct aom_read_bit_buffer rb;
++  AV1Decoder *pbi = frame->pbi;
++  AV1_COMMON *cm = &pbi->common;
++  CommonTileParams *tiles = &cm->tiles;
++  MACROBLOCKD *const xd = &frame->pbi->dcb.xd;
++  aom_writer skip_writer = {
++    .allow_update_cdf = !cm->features.disable_cdf_update
++  };
++  RawObu *tg;
++  RawObu *seq = frame->seq;
++  RawObu *frame_header;
++  uint8_t buf[UINT8_MAX] = { 0 };
++
++  if (v.x >= tiles->cols  && v.y >= tiles->rows) {
++    return AOM_REWRITER_COORD_ERROR;
++  }
++
++  for (size_t i = 0; i < frame->seq->active_count; i++) {
++    if (seq->attaches[i]->header.spatial_layer_id == 0) {
++      continue;
++    }
++    frame_header = seq->attaches[i];
++  }
++
++  pbi->next_start_tile = v.y * tiles->cols + v.x;
++  tg = frame_header->attaches[pbi->next_start_tile];
++
++  av1_init_read_bit_buffer(pbi, &rb, tg->ptr + tg->header.size, tg->ptr + tg->size);
++  hdr_size = read_tile_group_header(pbi, &rb, &start_tile, &end_tile, 0);
++
++  buf[REWRITE_HEADER]    = 0x26; // {forbidden=0:type=4:size_filed=1:extension=1:reserved=0} 
++  buf[REWRITE_EXTENSION] = 0x08; // {temporal_id=0:spatial_id=1}
++  buf[REWRITE_SIZE]      = 0x0e;
++  offset += 3;
++  memcpy(buf + offset, tg->ptr + tg->header.size, hdr_size);
++  offset += hdr_size;
++  tg->ptr = buf;
++
++  aom_start_encode(&skip_writer, buf + offset);
++  av1_tile_init(&tile_info, cm, v.y, v.x);
++  set_default_ctx(cm, xd, &tile_info);
++  for (int mi_row = tile_info.mi_row_start; mi_row < tile_info.mi_row_end;
++       mi_row += cm->seq_params->mib_size) {
++      av1_zero_left_context(xd);
++      for (int mi_col = tile_info.mi_col_start; mi_col < tile_info.mi_col_end;
++           mi_col += cm->seq_params->mib_size) {
++        rewrite_modes_sb(cm, xd, &tile_info, &skip_writer,
++                        mi_row, mi_col, cm->seq_params->sb_size);
++    }
++  }
++  aom_stop_encode(&skip_writer);
++
++  buf[REWRITE_SIZE] = offset;
++  offset += skip_writer.pos;
++  assert(offset < UINT8_MAX);
++  buf[REWRITE_SIZE] = offset - 3;
++  // buf[offset - 1] &= (uint8_t)(0xff << (skip_writer.ec.offs & 0x7));
++
++  tg->size = offset;
++
++  dump_raw_frame_to_rewriter_buffer(frame);
++
++  return AOM_REWRITER_OK;
++}
++
++static AOM_INLINE void raw_obu_free(RawObu *obu) {
++  if (obu) {
++    for (size_t i = 0; i < obu->active_count; i++) {
++      raw_obu_free(obu->attaches[i]);
++    }
++    obu->active_count = 0;
++    aom_free(obu);
++  }
++}
++
++void amo_raw_frame_free(RawFrame **frame_ptr) {
++  RawFrame *frame = *frame_ptr;
++  RawObu *seq = frame->seq;
++
++  for (size_t i = 0; i < seq->active_count; i++) {
++    raw_obu_free(seq->attaches[i]);
++    seq->attaches[i] = NULL;
++  }
++  frame->seq->active_count = 0;
++}
++
++void aom_raw_frame_deallocator(RawFrame **frame_ptr) {
++  RawFrame *frame = *frame_ptr;
++
++  if (frame->td) {
++    aom_free(frame->td);
++  }
++  rewriter_deallocator(&frame->rewriter);
++  amo_raw_frame_free(frame_ptr);
++}
+diff --git a/examples/bitstream_rewriter.h b/examples/bitstream_rewriter.h
+new file mode 100644
+index 000000000..5726f5608
+--- /dev/null
++++ b/examples/bitstream_rewriter.h
+@@ -0,0 +1,81 @@
++/*
++ * Copyright (c) 2021, Alliance for Open Media. All rights reserved
++ *
++ * This source code is subject to the terms of the BSD 2 Clause License and
++ * the Alliance for Open Media Patent License 1.0. If the BSD 2 Clause License
++ * was not distributed with this source code in the LICENSE file, you can
++ * obtain it at www.aomedia.org/license/software. If the Alliance for Open
++ * Media Patent License 1.0 was not distributed with this source code in the
++ * PATENTS file, you can obtain it at www.aomedia.org/license/patent.
++ */
++
++#ifndef BITSTREAM_REWRITER_H_
++#define BITSTREAM_REWRITER_H_
++
++#include <stdio.h>
++#include <stdint.h>
++#include "av1/common/obu_util.h"
++#include "av1/common/av1_common_int.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++struct AV1Decoder;
++struct aom_read_bit_buffer;
++
++enum {
++  AOM_REWRITER_COORD_ERROR = -1,
++  AOM_REWRITER_MEM_ERROR   = 1114,
++  AOM_REWRITER_OK          = 0
++};
++
++typedef struct RawObu {
++  const uint8_t *ptr;
++  size_t size;
++  ObuHeader header;
++  size_t active_count;
++  size_t capacity;
++  struct RawObu **attaches;
++} RawObu;
++
++typedef struct RewriterBuffer {
++  uint8_t *buf;
++  size_t capacity;
++  size_t size;
++  size_t pos;
++} RewriterBuffer;
++
++typedef struct RawFrame {
++  struct AV1Decoder *pbi;
++  int need_rewrite;
++  RewriterBuffer rewriter;
++  const uint8_t *buffer;
++  size_t size;
++  size_t index;
++  RawObu *td;
++  RawObu *seq;
++  CommonTileParams *tiles;
++} RawFrame;
++
++typedef struct Vector2 {
++    int x;
++    int y;
++    int w;
++} Vector2;
++
++int is_temporal_delimiter(uint8_t *buffer, size_t size);
++
++int amo_raw_frame_buffer_parser(RawFrame *frame, const uint8_t *buffer, size_t size);
++
++int amo_raw_frame_buffer_rewriter(RawFrame *frame, Vector2 v);
++
++void amo_raw_frame_free(RawFrame **frame_ptr);
++
++void aom_raw_frame_deallocator(RawFrame **frame_ptr);
++
++#ifdef __cplusplus
++}  // extern "C"
++#endif
++
++#endif  // BITSTREAM_REWRITER_H_
+diff --git a/examples/svc_encoder_rtc.c b/examples/svc_encoder_rtc.c
+index 4605923f5..9e9aef5ee 100644
+--- a/examples/svc_encoder_rtc.c
++++ b/examples/svc_encoder_rtc.c
+@@ -26,6 +26,7 @@
+ #include "common/video_writer.h"
+ #include "examples/encoder_util.h"
+ #include "aom_ports/aom_timer.h"
++#include "bitstream_rewriter.h"
+ 
+ #define OPTION_BUFFER_SIZE 1024
+ 
+@@ -1086,10 +1087,13 @@ int main(int argc, const char **argv) {
+   }
+ #endif
+ #if CONFIG_AV1_DECODER
+-  int mismatch_seen = 0;
++  // int mismatch_seen = 0;
+   aom_codec_ctx_t decoder;
+ #endif
+ 
++  RawFrame *raw_frame_ref = (RawFrame *)aom_malloc(sizeof(RawFrame));
++  memset(raw_frame_ref, 0, sizeof(RawFrame));
++
+   struct RateControlMetrics rc;
+   int64_t cx_time = 0;
+   int64_t cx_time_sl[3];  // max number of spatial layers.
+@@ -1393,9 +1397,24 @@ int main(int argc, const char **argv) {
+               fwrite(pkt->data.frame.buf, 1, pkt->data.frame.sz,
+                      total_layer_obu_file);
+             } else {
+-              aom_video_writer_write_frame(total_layer_file,
+-                                           pkt->data.frame.buf,
+-                                           pkt->data.frame.sz, pts);
++              Vector2 pos = { 
++                .x = 1, 
++                .y = 0,
++                .w = 0
++              };
++              amo_raw_frame_buffer_parser(raw_frame_ref, pkt->data.frame.buf,
++                                           pkt->data.frame.sz);
++              if (!raw_frame_ref->need_rewrite) {
++                aom_video_writer_write_frame(total_layer_file,
++                                            pkt->data.frame.buf,
++                                            pkt->data.frame.sz, pts);
++              } else {
++                amo_raw_frame_buffer_rewriter(raw_frame_ref, pos);
++                aom_video_writer_write_frame(total_layer_file,
++                                            raw_frame_ref->rewriter.buf,
++                                            raw_frame_ref->rewriter.pos, pts);
++              }
++              amo_raw_frame_free(&raw_frame_ref);
+             }
+             // Keep count of rate control stats per layer (for non-key).
+             if (!(pkt->data.frame.flags & AOM_FRAME_IS_KEY)) {
+@@ -1439,7 +1458,7 @@ int main(int argc, const char **argv) {
+               }
+             }
+ 
+-#if CONFIG_AV1_DECODER1
++#ifdef CONFIG_AV1_DECODER1
+             if (aom_codec_decode(&decoder, pkt->data.frame.buf,
+                                  (unsigned int)pkt->data.frame.sz, NULL))
+               die_codec(&decoder, "Failed to decode frame.");
+@@ -1449,7 +1468,7 @@ int main(int argc, const char **argv) {
+           default: break;
+         }
+       }
+-#if CONFIG_AV1_DECODER1
++#ifdef CONFIG_AV1_DECODER1
+       // Don't look for mismatch on top spatial and top temporal layers as they
+       // are non reference frames.
+       if ((ss_number_layers > 1 || ts_number_layers > 1) &&
+@@ -1498,5 +1517,7 @@ int main(int argc, const char **argv) {
+   if (app_input.input_ctx.file_type != FILE_TYPE_Y4M) {
+     aom_img_free(&raw);
+   }
++  
++  aom_raw_frame_deallocator(&raw_frame_ref);
+   return EXIT_SUCCESS;
+ }
+-- 
+2.17.1
+

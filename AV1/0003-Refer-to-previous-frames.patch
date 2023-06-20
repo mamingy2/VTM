@@ -1,0 +1,57 @@
+From 56e504a5c7835ff47f247e19de8ea29242a6983a Mon Sep 17 00:00:00 2001
+From: mamingy2 <mingyang.ma@intel.com>
+Date: Thu, 8 Sep 2022 14:01:17 +0800
+Subject: [PATCH 2/2] Refer to previous frames
+
+---
+ examples/svc_encoder_rtc.c | 26 ++++++++++++++++++++++----
+ 1 file changed, 22 insertions(+), 4 deletions(-)
+
+diff --git a/examples/svc_encoder_rtc.c b/examples/svc_encoder_rtc.c
+index 563b674e6..529458286 100644
+--- a/examples/svc_encoder_rtc.c
++++ b/examples/svc_encoder_rtc.c
+@@ -723,9 +723,26 @@ static void set_layer_pattern(
+       layer_id->temporal_layer_id = 0;
+       if (layer_id->spatial_layer_id == 0) {
+         // Reference LAST, update LAST.
+-        for (int s = 0; s < 8; s++)
+-          ref_frame_config->refresh[s] = 1;
+-        ref_frame_config->reference[SVC_LAST_FRAME] = 1;
++        static int frames = 0;
++        {
++           const int idx = frames % 5;
++           ref_frame_config->refresh[0] = 1;
++           ref_frame_config->refresh[idx + 2] = 1;
++#if 0
++           for (int ii = 0; ii < SVC_GOLDEN_FRAME; ii++) {
++              ref_frame_config->ref_idx[ii] = (idx - ii + 7) % 7;
++               printf("ref_idx = %d, %d\n", ii, ref_frame_config->ref_idx[ii]);
++           }
++           ref_frame_config->ref_idx[SVC_GOLDEN_FRAME] = 0;
++           printf("%d, %d\n", idx, ref_frame_config->refresh[idx + 1]);
++#endif
++#if 0
++           for (int ii = SVC_BWDREF_FRAME; ii <= SVC_ALTREF_FRAME; ii++) {
++              ref_frame_config->ref_idx[ii] =  (idx - ii - 1) % 7;
++           }
++#endif
++        }
++        frames++;
+       } else if (layer_id->spatial_layer_id == 1) {
+ #if 0
+         // Reference LAST and GOLDEN. Set buffer_idx for LAST to slot 1
+@@ -736,8 +753,9 @@ static void set_layer_pattern(
+         ref_frame_config->reference[SVC_LAST_FRAME] = 1;
+         ref_frame_config->reference[SVC_GOLDEN_FRAME] = 1;
+ #endif
+-        ref_frame_config->reference[SVC_LAST_FRAME] = 1;
+       }
++      for (int s = 0; s < 7; s++)
++        ref_frame_config->reference[s] = 1;
+       break;
+     case 6:
+       // 3 spatial layers, 1 temporal.
+-- 
+2.17.1
+

@@ -1,0 +1,534 @@
+From 9f7cc5e04a02ee4a66c4ed088026710d483c9322 Mon Sep 17 00:00:00 2001
+From: mamingy2 <mingyang.ma@intel.com>
+Date: Tue, 20 Jun 2023 14:01:35 +0800
+Subject: [PATCH 4/4] Parse a VVC stream and rewrite certain tiles.
+
+---
+ source/App/SkipApp/CMakeLists.txt  |   2 +-
+ source/App/SkipApp/SkipApp.cpp     |  36 ++++++++--
+ source/App/SkipApp/SkipApp.h       |   2 +-
+ source/Lib/CommonLib/BitStream.cpp |  14 ++++
+ source/Lib/CommonLib/BitStream.h   |   1 +
+ source/Lib/SkipLib/DecLib.cpp      |  13 ++--
+ source/Lib/SkipLib/DecLib.h        |   4 +-
+ source/Lib/SkipLib/DecSlice.cpp    | 103 ++++++++++++++++++++++++++++-
+ source/Lib/SkipLib/DecSlice.h      |   3 +-
+ source/Lib/SkipLib/VLCReader.cpp   |   5 +-
+ source/Lib/SkipLib/VLCReader.h     |   2 +-
+ source/Lib/SkipLib/VLCWriter.cpp   |  33 ++++++++-
+ source/Lib/SkipLib/VLCWriter.h     |   1 +
+ 13 files changed, 198 insertions(+), 21 deletions(-)
+
+diff --git a/source/App/SkipApp/CMakeLists.txt b/source/App/SkipApp/CMakeLists.txt
+index 6f149da4..abc0d3f5 100644
+--- a/source/App/SkipApp/CMakeLists.txt
++++ b/source/App/SkipApp/CMakeLists.txt
+@@ -46,7 +46,7 @@ if( CMAKE_COMPILER_IS_GNUCC AND BUILD_STATIC )
+   target_compile_definitions( ${EXE_NAME} PUBLIC ENABLE_WPP_STATIC_LINK=1 )
+ endif()
+ 
+-target_link_libraries( ${EXE_NAME} CommonLib DecoderLib Utilities ${ADDITIONAL_LIBS} )
++target_link_libraries( ${EXE_NAME} CommonLib SkipLib Utilities ${ADDITIONAL_LIBS} )
+ 
+ # lldb custom data formatters
+ if( XCODE )
+diff --git a/source/App/SkipApp/SkipApp.cpp b/source/App/SkipApp/SkipApp.cpp
+index f6cb0f7c..28e71b93 100644
+--- a/source/App/SkipApp/SkipApp.cpp
++++ b/source/App/SkipApp/SkipApp.cpp
+@@ -41,8 +41,8 @@
+ #include <fcntl.h>
+ 
+ #include "SkipApp.h"
+-#include "DecoderLib/AnnexBread.h"
+-#include "DecoderLib/NALread.h"
++#include "SkipLib/AnnexBread.h"
++#include "SkipLib/NALread.h"
+ #if RExt__DECODER_DEBUG_STATISTICS
+ #include "CommonLib/CodingStatistics.h"
+ #endif
+@@ -98,14 +98,18 @@ uint32_t SkipApp::decode()
+   featureCounter.bytes = (int) bitstreamSize.tellg() - (int) fsize;
+   bitstreamSize.close();
+ #endif
+-
++  std::ifstream InputForParse(m_bitstreamFileName.c_str(), std::ifstream::in | std::ifstream::binary);
++  std::ifstream InputForRead(m_bitstreamFileName.c_str(), std::ifstream::in | std::ifstream::binary);
+   std::ifstream bitstreamFile(m_bitstreamFileName.c_str(), std::ifstream::in | std::ifstream::binary);
++  std::ofstream OutputBitstream("rewrite.bin", std::ostream::binary);
+   if (!bitstreamFile)
+   {
+     EXIT( "Failed to open bitstream file " << m_bitstreamFileName.c_str() << " for reading" ) ;
+   }
+ 
+   InputByteStream bytestream(bitstreamFile);
++  InputByteStream inputstreamParse(InputForParse);
++  static const uint8_t startCodePrefix[] = {0,0,0,1};
+ 
+   if (!m_outputDecodedSEIMessagesFilename.empty() && m_outputDecodedSEIMessagesFilename!="-")
+   {
+@@ -202,6 +206,30 @@ uint32_t SkipApp::decode()
+ 
+     // determine if next NAL unit will be the first one from a new picture
+     bool bNewPicture = m_cDecLib.isNewPicture(&bitstreamFile, &bytestream);
++    // if is not new Picture, passthrough the bitstream
++    if (!bNewPicture) {
++      InputNALUnit nalu1;
++      AnnexBStats stats1 = AnnexBStats();
++
++      byteStreamNALUnit(inputstreamParse, nalu1.getBitstream().getFifo(), stats1);
++      read(nalu1);
++
++      OutputBitstream.write(reinterpret_cast<const char*>(startCodePrefix), 4);
++      char buffer[102400];
++      char decay[102400];
++      for (;;) {
++        InputForRead.read(decay, 1);
++        if (decay[0] == (char)1) {
++            break;
++        }
++      }
++      InputForRead.read(buffer, stats1.m_numBytesInNALUnit);
++      if (nalu1.m_nalUnitType == NAL_UNIT_CODED_SLICE_IDR_N_LP || nalu1.m_nalUnitType == NAL_UNIT_CODED_SLICE_TRAIL) {
++        memset(buffer, 0, sizeof(buffer));
++      } else {
++        OutputBitstream.write(buffer, stats1.m_numBytesInNALUnit);
++      }
++    }
+     bool bNewAccessUnit = bNewPicture && decodedSliceInAU && m_cDecLib.isNewAccessUnit( bNewPicture, &bitstreamFile, &bytestream );
+     if(!bNewPicture)
+     {
+@@ -277,7 +305,7 @@ uint32_t SkipApp::decode()
+           }
+ 
+           int skipFrameCounter = m_iSkipFrame;
+-          m_cDecLib.decode(nalu, m_iSkipFrame, m_iPOCLastDisplay, m_targetOlsIdx);
++          m_cDecLib.decode(nalu, m_iSkipFrame, m_iPOCLastDisplay, m_targetOlsIdx, &OutputBitstream);
+ 
+           if ( prevPicSkipped && nalu.m_nalUnitType == NAL_UNIT_CODED_SLICE_GDR )
+           {
+diff --git a/source/App/SkipApp/SkipApp.h b/source/App/SkipApp/SkipApp.h
+index b505ceb4..bd98e624 100644
+--- a/source/App/SkipApp/SkipApp.h
++++ b/source/App/SkipApp/SkipApp.h
+@@ -42,7 +42,7 @@
+ 
+ #include "Utilities/VideoIOYuv.h"
+ #include "CommonLib/Picture.h"
+-#include "DecoderLib/DecLib.h"
++#include "SkipLib/DecLib.h"
+ #include "SkipAppCfg.h"
+ 
+ //! \ingroup DecoderApp
+diff --git a/source/Lib/CommonLib/BitStream.cpp b/source/Lib/CommonLib/BitStream.cpp
+index b0f31db8..a58a4154 100644
+--- a/source/Lib/CommonLib/BitStream.cpp
++++ b/source/Lib/CommonLib/BitStream.cpp
+@@ -185,6 +185,20 @@ void   OutputBitstream::addSubstream( OutputBitstream* pcSubstream )
+   }
+ }
+ 
++void   OutputBitstream::addSubstream( const std::vector<uint8_t> &rbsp, uint32_t numBits )
++{
++  for (int idx = 0; idx < (numBits >> 3); ++idx) {
++    write(rbsp[idx], BITS_PER_BYTE);
++  }
++
++  const uint32_t numTrailingBits = numBits & BITS_PER_BYTE_MASK;
++
++  if (numTrailingBits != 0)
++  {
++    write(rbsp[(numBits >> 3)] >> (BITS_PER_BYTE - numTrailingBits), numTrailingBits);
++  }
++}
++
+ void OutputBitstream::writeByteAlignment()
+ {
+   write(1, 1);
+diff --git a/source/Lib/CommonLib/BitStream.h b/source/Lib/CommonLib/BitStream.h
+index 52acb8d3..3cf0b99c 100644
+--- a/source/Lib/CommonLib/BitStream.h
++++ b/source/Lib/CommonLib/BitStream.h
+@@ -137,6 +137,7 @@ public:
+   const std::vector<uint8_t> &getFifo() const { return m_fifo; }
+ 
+   void          addSubstream    ( OutputBitstream* pcSubstream );
++  void          addSubstream    ( const std::vector<uint8_t> &rbsp, uint32_t numBits );
+   void writeByteAlignment();
+ 
+   //! returns the number of start code emulations contained in the current buffer
+diff --git a/source/Lib/SkipLib/DecLib.cpp b/source/Lib/SkipLib/DecLib.cpp
+index 3d87d73d..f53b3a08 100644
+--- a/source/Lib/SkipLib/DecLib.cpp
++++ b/source/Lib/SkipLib/DecLib.cpp
+@@ -137,7 +137,7 @@ bool tryDecodePicture(Picture *pcEncPic, const int expectedPoc, const std::strin
+           read(nalu);
+           int iSkipFrame = 0;
+ 
+-          pcDecLib->decode(nalu, iSkipFrame, iPOCLastDisplay, 0);
++          pcDecLib->decode(nalu, iSkipFrame, iPOCLastDisplay, 0, nullptr);
+         }
+       }
+ 
+@@ -2728,7 +2728,7 @@ bool DecLib::getMixedNaluTypesInPicFlag()
+   return pps->getMixedNaluTypesInPicFlag();
+ }
+ 
+-bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDisplay )
++bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDisplay, std::ofstream* rewriteStream)
+ {
+   m_apcSlicePilot->setPicHeader( &m_picHeader );
+   m_apcSlicePilot->initSlice(); // the slice pilot is an object to prepare for a new slice
+@@ -2772,7 +2772,8 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
+ 
+   m_HLSReader.setBitstream( &nalu.getBitstream() );
+   m_apcSlicePilot->m_ccAlfFilterParam = m_cALF.getCcAlfFilterParam();
+-  m_HLSReader.parseSliceHeader( m_apcSlicePilot, &m_picHeader, &m_parameterSetManager, m_prevTid0POC, m_prevPicPOC );
++  uint32_t entryPointIdxBits = 0;
++  m_HLSReader.parseSliceHeader( m_apcSlicePilot, &m_picHeader, &m_parameterSetManager, m_prevTid0POC, m_prevPicPOC, entryPointIdxBits );
+ 
+   if (m_picHeader.getGdrOrIrapPicFlag() && m_bFirstSliceInPicture)
+   {
+@@ -3505,7 +3506,7 @@ bool DecLib::xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDispl
+ #endif
+   //  Decode a picture
+   // m_cSliceDecoder.deSliceAndSkip( pcSlice, &( nalu.getBitstream() ) );
+-  m_cSliceDecoder.decompressSlice( pcSlice, &( nalu.getBitstream() ), ( m_pcPic->poc == getDebugPOC() ? getDebugCTU() : -1 ) );
++  m_cSliceDecoder.decompressSlice( pcSlice, &( nalu.getBitstream() ), ( m_pcPic->poc == getDebugPOC() ? getDebugCTU() : -1 ) , rewriteStream, entryPointIdxBits);
+ #if GREEN_METADATA_SEI_ENABLED
+   this->m_featureCounter = pcSlice->getFeatureCounter();
+ #endif
+@@ -3665,7 +3666,7 @@ void DecLib::xDecodeAPS(InputNALUnit& nalu)
+   m_parameterSetManager.storeAPS(aps, nalu.getBitstream().getFifo());
+ }
+ 
+-bool DecLib::decode(InputNALUnit& nalu, int& iSkipFrame, int& iPOCLastDisplay, int iTargetOlsIdx)
++bool DecLib::decode(InputNALUnit& nalu, int& iSkipFrame, int& iPOCLastDisplay, int iTargetOlsIdx, std::ofstream* rewriteStream)
+ {
+   bool ret;
+   // ignore all NAL units of layers > 0
+@@ -3767,7 +3768,7 @@ bool DecLib::decode(InputNALUnit& nalu, int& iSkipFrame, int& iPOCLastDisplay, i
+   case NAL_UNIT_CODED_SLICE_CRA:
+   case NAL_UNIT_CODED_SLICE_GDR:
+   case NAL_UNIT_CODED_SLICE_RADL:
+-  case NAL_UNIT_CODED_SLICE_RASL: ret = xDecodeSlice(nalu, iSkipFrame, iPOCLastDisplay); return ret;
++  case NAL_UNIT_CODED_SLICE_RASL: ret = xDecodeSlice(nalu, iSkipFrame, iPOCLastDisplay, rewriteStream); return ret;
+ 
+   case NAL_UNIT_EOS:
+     m_associatedIRAPType[nalu.m_nuhLayerId]            = NAL_UNIT_INVALID;
+diff --git a/source/Lib/SkipLib/DecLib.h b/source/Lib/SkipLib/DecLib.h
+index f156339b..d788c624 100644
+--- a/source/Lib/SkipLib/DecLib.h
++++ b/source/Lib/SkipLib/DecLib.h
+@@ -259,7 +259,7 @@ public:
+     const std::string& cacheCfgFileName
+ #endif
+   );
+-  bool  decode(InputNALUnit& nalu, int& iSkipFrame, int& iPOCLastDisplay, int iTargetOlsIdx);
++  bool  decode(InputNALUnit& nalu, int& iSkipFrame, int& iPOCLastDisplay, int iTargetOlsIdx, std::ofstream* rewriteStream);
+   void  deletePicBuffer();
+ 
+   void  executeLoopFilters();
+@@ -381,7 +381,7 @@ protected:
+   void  xActivateParameterSets( const InputNALUnit nalu );
+   void  xCheckParameterSetConstraints( const int layerId );
+   void      xDecodePicHeader( InputNALUnit& nalu );
+-  bool      xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDisplay);
++  bool      xDecodeSlice(InputNALUnit &nalu, int &iSkipFrame, int iPOCLastDisplay, std::ofstream* rewriteStream);
+   void      xDecodeOPI( InputNALUnit& nalu );
+   void      xDecodeVPS( InputNALUnit& nalu );
+   void      xDecodeDCI( InputNALUnit& nalu );
+diff --git a/source/Lib/SkipLib/DecSlice.cpp b/source/Lib/SkipLib/DecSlice.cpp
+index 7221227d..7f6f6022 100644
+--- a/source/Lib/SkipLib/DecSlice.cpp
++++ b/source/Lib/SkipLib/DecSlice.cpp
+@@ -38,8 +38,13 @@
+ #include "DecSlice.h"
+ #include "CommonLib/UnitTools.h"
+ #include "CommonLib/dtrace_next.h"
++#include "CABACWriter.h"
++#include "BinEncoder.h"
++#include "VLCReader.h"
++#include "VLCWriter.h"
+ 
+ #include <vector>
++#include <fstream>
+ 
+ //! \ingroup DecoderLib
+ //! \{
+@@ -71,7 +76,7 @@ void DecSlice::init( CABACDecoder* cabacDecoder, DecCu* pcCuDecoder )
+ }
+ 
+ 
+-void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int debugCTU )
++void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int debugCTU , std::ofstream* rewriteStream, const uint32_t entryPointStartBit)
+ {
+   //-- For time output for each slice
+   slice->startProcessingTimer();
+@@ -108,11 +113,25 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
+   // Table of extracted substreams.
+   std::vector<InputBitstream*> ppcSubstreams( numSubstreams );
+   OutputBitstream outputBitStream;
++
++  HLSWriter                 hlsWriter;
++  hlsWriter.setBitstream(&outputBitStream);
++  // If a slice could be rewriten, it should reserve sh_entry_offset_len_minus_1 and following offsets[]
++  if (entryPointStartBit && slice->getPOC() != 0)
++    outputBitStream.addSubstream(bitstream->getFifo(), entryPointStartBit);
++  else
++    outputBitStream.addSubstream(bitstream->getFifo(), bitstream->getNumBitsRead());
++
+   for( unsigned idx = 0; idx < numSubstreams; idx++ )
+   {
+     ppcSubstreams[idx] = bitstream->extractSubstream( idx+1 < numSubstreams ? ( slice->getSubstreamSize(idx) << 3 ) : bitstream->getNumBitsLeft() );
+     std::vector<uint8_t> fifo = ppcSubstreams[idx]->getFifo();
+-    std::cout << "\n fifo " << idx << " size: " << fifo.size();
++    if (m_fifos.size() <= idx) {
++      m_fifos.push_back(fifo);
++    }
++    else {
++      m_fifos[idx] = fifo;
++    }
+   }
+ 
+ 
+@@ -140,6 +159,23 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
+   }
+   // for every CTU in the slice segment...
+   unsigned subStrmId = 0;
++  // rewrite first
++  std::vector<OutputBitstream> outputSubBitStreams;
++  OutputBitstream output_temp;
++  CABACEncoder cabacEncoder;
++  CABACWriter* pCabacWriter = cabacEncoder.getCABACWriter(sps);
++  pCabacWriter->initCtxModels(*slice);
++
++  if (!slice->getPPS()->getLayerId() || (slice->getPPS()->getLayerId() && slice->getPOC() == 0 ))
++  {
++    for (int idx = 0; idx < numSubstreams; ++idx)
++    {
++      output_temp.addSubstream(ppcSubstreams[idx]->getFifo(), ppcSubstreams[idx]->getFifo().size() << 3);
++      // output_temp.addSubstream(m_fifos[idx], m_fifos[idx].size() << 3);
++      outputSubBitStreams.push_back(output_temp);
++      output_temp.clear();
++    }
++  }
+ 
+   for( unsigned ctuIdx = 0; ctuIdx < slice->getNumCtuInSlice(); ctuIdx++ )
+   {
+@@ -238,7 +274,47 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
+       break;
+     }
+     cabacReader.coding_tree_unit( cs, ctuArea, pic->m_prevQP, ctuRsAddr );
++    if (slice->getPPS()->getLayerId() && slice->getPOC() != 0 ) {//  && tileIdx == 2
++      while (outputSubBitStreams.size() <= subStrmId) {
++        if (tileIdx == 3) {
++          outputSubBitStreams.push_back(output_temp);
++        }
++        else {
++          output_temp.addSubstream(m_fifos[subStrmId], m_fifos[subStrmId].size() << 3);
++          outputSubBitStreams.push_back(output_temp);
++          output_temp.clear();
++        }
++      }
++      pCabacWriter->initBitstream(&outputSubBitStreams[subStrmId]);
++      // Check if first CTU
++      bool isFirstCtuinTile = ctuIdx == 0;
++      if (ctuIdx) {
++          isFirstCtuinTile = tileIdx != cs.pps->getTileIdx( slice->getCtuAddrInSlice( ctuIdx - 1 ) );
++      }
++      bool isLastCTUsinSlice = ctuIdx == slice->getNumCtuInSlice()-1;
++      bool isLastCTUinTile  = !isLastCTUsinSlice && tileIdx != cs.pps->getTileIdx( slice->getCtuAddrInSlice( ctuIdx + 1 ) );
++      if (tileIdx == 3) {
++        const ChannelType chType = ChannelType( 0 );
++        for( auto &currCU : cs.traverseCUs( CS::getArea( cs, ctuArea, chType ), chType ) ) {
++          CodingUnit cu = currCU;
++          cu.skip = true;
++          cu.block(currCU.chType).size().width = 128;
++          cu.block(currCU.chType).size().height = 128;
++          cu.mmvdSkip = false;
++          cu.depth = 0;
++          pCabacWriter->rewrite(isFirstCtuinTile, cu);
++          break;
++        }
++      }
+ 
++      if (isLastCTUsinSlice || isLastCTUinTile) {
++        if (tileIdx == 3) {
++          pCabacWriter->end_of_slice();
++          outputSubBitStreams[subStrmId].writeByteAlignment();
++        }
++        m_fifos[subStrmId] = outputSubBitStreams[subStrmId].getFifo();
++      }
++    }
+     m_pcCuDecoder->decompressCtu( cs, ctuArea );
+ #if GREEN_METADATA_SEI_ENABLED
+     FeatureCounterStruct featureCounter = slice->getFeatureCounter();
+@@ -298,6 +374,29 @@ void DecSlice::decompressSlice( Slice* slice, InputBitstream* bitstream, int deb
+       }
+     }
+   }
++  if (entryPointStartBit && slice->getPOC() != 0){
++    hlsWriter.setBitstream(&outputBitStream);
++    hlsWriter.codeTilesWPPEntryPoint(m_fifos, numSubstreams);
++    outputBitStream.writeByteAlignment();
++  }
++
++  OutputBitstream  *pcBitstreamRedirect;
++  pcBitstreamRedirect = new OutputBitstream;
++  OutputBitstream *pcOut = pcBitstreamRedirect;
++  for ( uint32_t ui = 0 ; ui < numSubstreams; ui++ )
++  {
++    pcOut->addSubstream(&(outputSubBitStreams[ui]));
++  }
++
++  if (pcOut->getNumberOfWrittenBits() > 0)
++  {
++    outputBitStream.addSubstream(pcOut);
++    char buf[outputBitStream.getFifo().size()];
++    memcpy(buf, outputBitStream.getFifo().data(), outputBitStream.getFifo().size());
++    rewriteStream->write(buf, outputBitStream.getFifo().size());
++  }
++  outputBitStream.clear();
++  delete pcBitstreamRedirect;
+   
+ #if GREEN_METADATA_SEI_ENABLED
+   FeatureCounterStruct featureCounter = slice->getFeatureCounter();
+diff --git a/source/Lib/SkipLib/DecSlice.h b/source/Lib/SkipLib/DecSlice.h
+index acefcc51..f3e5be6e 100644
+--- a/source/Lib/SkipLib/DecSlice.h
++++ b/source/Lib/SkipLib/DecSlice.h
+@@ -59,6 +59,7 @@ private:
+   // access channel
+   CABACDecoder*   m_CABACDecoder;
+   DecCu*          m_pcCuDecoder;
++  std::vector<std::vector<uint8_t>> m_fifos;
+ 
+   Ctx             m_entropyCodingSyncContextState;      ///< context storage for state of contexts at the wavefront/WPP/entropy-coding-sync second CTU of tile-row
+   PLTBuf          m_palettePredictorSyncState;      /// palette predictor storage at wavefront/WPP
+@@ -71,7 +72,7 @@ public:
+   void  create            ();
+   void  destroy           ();
+ 
+-  void  decompressSlice   ( Slice* slice, InputBitstream* bitstream, int debugCTU );
++  void  decompressSlice   ( Slice* slice, InputBitstream* bitstream, int debugCTU, std::ofstream* rewriteStream, const uint32_t);
+ };
+ 
+ //! \}
+diff --git a/source/Lib/SkipLib/VLCReader.cpp b/source/Lib/SkipLib/VLCReader.cpp
+index db0f35ed..c4a4ca91 100644
+--- a/source/Lib/SkipLib/VLCReader.cpp
++++ b/source/Lib/SkipLib/VLCReader.cpp
+@@ -3523,7 +3523,7 @@ void  HLSyntaxReader::checkAlfNaluTidAndPicTid(Slice* pcSlice, PicHeader* picHea
+   }
+ }
+ 
+-void HLSyntaxReader::parseSliceHeader (Slice* pcSlice, PicHeader* picHeader, ParameterSetManager *parameterSetManager, const int prevTid0POC, const int prevPicPOC)
++void HLSyntaxReader::parseSliceHeader (Slice* pcSlice, PicHeader* picHeader, ParameterSetManager *parameterSetManager, const int prevTid0POC, const int prevPicPOC, uint32_t& entryIdx)
+ {
+   uint32_t  uiCode;
+   int   iCode;
+@@ -4366,9 +4366,11 @@ void HLSyntaxReader::parseSliceHeader (Slice* pcSlice, PicHeader* picHeader, Par
+   pcSlice->setNumSubstream(sps, pps);
+ 
+   pcSlice->setNumEntryPoints( sps, pps );
++  uint32_t entryPointIdxBits = 0;
+   if( pcSlice->getNumEntryPoints() > 0 )
+   {
+     uint32_t offsetLenMinus1;
++    entryPointIdxBits = m_pcBitstream->getNumBitsRead();
+     xReadUvlc( offsetLenMinus1, "sh_entry_offset_len_minus1" );
+     entryPointOffset.resize( pcSlice->getNumEntryPoints() );
+     for( uint32_t idx = 0; idx < pcSlice->getNumEntryPoints(); idx++ )
+@@ -4377,6 +4379,7 @@ void HLSyntaxReader::parseSliceHeader (Slice* pcSlice, PicHeader* picHeader, Par
+       entryPointOffset[idx] = uiCode + 1;
+     }
+   }
++  entryIdx = entryPointIdxBits;
+ 
+ #if RExt__DECODER_DEBUG_BIT_STATISTICS
+   CodingStatistics::IncrementStatisticEP(STATS__BYTE_ALIGNMENT_BITS,m_pcBitstream->readByteAlignment(),0);
+diff --git a/source/Lib/SkipLib/VLCReader.h b/source/Lib/SkipLib/VLCReader.h
+index 21c7daf2..53932593 100644
+--- a/source/Lib/SkipLib/VLCReader.h
++++ b/source/Lib/SkipLib/VLCReader.h
+@@ -124,7 +124,7 @@ public:
+   void parseGeneralHrdParameters(GeneralHrdParams *generalHrd);
+   void  parsePictureHeader  ( PicHeader* picHeader, ParameterSetManager *parameterSetManager, bool readRbspTrailingBits );
+   void  checkAlfNaluTidAndPicTid(Slice* pcSlice, PicHeader* picHeader, ParameterSetManager *parameterSetManager);
+-  void  parseSliceHeader    ( Slice* pcSlice, PicHeader* picHeader, ParameterSetManager *parameterSetManager, const int prevTid0POC, const int prevPicPOC );
++  void  parseSliceHeader    ( Slice* pcSlice, PicHeader* picHeader, ParameterSetManager *parameterSetManager, const int prevTid0POC, const int prevPicPOC, uint32_t& );
+   void  getSlicePoc ( Slice* pcSlice, PicHeader* picHeader, ParameterSetManager *parameterSetManager, const int prevTid0POC );
+   void  parseTerminatingBit ( uint32_t& ruiBit );
+   void  parseRemainingBytes ( bool noTrailingBytesExpected );
+diff --git a/source/Lib/SkipLib/VLCWriter.cpp b/source/Lib/SkipLib/VLCWriter.cpp
+index 6369e8ba..fe64d820 100644
+--- a/source/Lib/SkipLib/VLCWriter.cpp
++++ b/source/Lib/SkipLib/VLCWriter.cpp
+@@ -36,13 +36,11 @@
+  */
+ 
+ #include "VLCWriter.h"
+-#include "SEIwrite.h"
+ 
+ #include "CommonLib/CommonDef.h"
+ #include "CommonLib/Unit.h"
+ #include "CommonLib/Picture.h" // th remove this
+ #include "CommonLib/dtrace_next.h"
+-#include "EncAdaptiveLoopFilter.h"
+ #include "CommonLib/AdaptiveLoopFilter.h"
+ #include "CommonLib/ProfileTierLevel.h"
+ 
+@@ -2851,6 +2849,37 @@ void  HLSWriter::codeTilesWPPEntryPoint( Slice* pSlice )
+   }
+ }
+ 
++void  HLSWriter::codeTilesWPPEntryPoint( const std::vector<std::vector<uint8_t>>& fifos, unsigned numSubstreams)
++{
++  if (numSubstreams-1 == 0)
++    return;
++  uint32_t maxOffset = 0;
++  for(int idx=0; idx<numSubstreams-1; idx++)
++  {
++    uint32_t offset=fifos[idx].size();
++    if ( offset > maxOffset )
++    {
++      maxOffset = offset;
++    }
++  }
++  // Determine number of bits "offsetLenMinus1+1" required for entry point information
++  uint32_t offsetLenMinus1 = 0;
++  while (maxOffset >= (1u << (offsetLenMinus1 + 1)))
++  {
++    offsetLenMinus1++;
++    CHECK(offsetLenMinus1 + 1 >= 32, "Invalid offset length minus 1");
++  }
++  if (numSubstreams > 0) 
++  {
++    xWriteUvlc(offsetLenMinus1, "sh_entry_offset_len_minus1");
++    for (uint32_t idx=0; idx<numSubstreams-1; idx++)
++    {
++      xWriteCode(fifos[idx].size() - 1, offsetLenMinus1+1, "sh_entry_point_offset_minus1");
++    }
++  }
++
++}
++
+ 
+ // ====================================================================================================================
+ // Protected member functions
+diff --git a/source/Lib/SkipLib/VLCWriter.h b/source/Lib/SkipLib/VLCWriter.h
+index 915b59f1..de215a78 100644
+--- a/source/Lib/SkipLib/VLCWriter.h
++++ b/source/Lib/SkipLib/VLCWriter.h
+@@ -131,6 +131,7 @@ public:
+ 
+   void codeGeneralHrdparameters(const GeneralHrdParams *hrd);
+   void  codeTilesWPPEntryPoint  ( Slice* pSlice );
++  void  codeTilesWPPEntryPoint  ( const std::vector<std::vector<uint8_t>>& fifos, unsigned numSubstreams);
+   void codeScalingList(const ScalingList &scalingList, bool aps_chromaPresentFlag);
+   void alfFilter( const AlfParam& alfParam, const bool isChroma, const int altIdx );
+   void dpb_parameters(int maxSubLayersMinus1, bool subLayerInfoFlag, const SPS *pcSPS);
+-- 
+2.17.1
+

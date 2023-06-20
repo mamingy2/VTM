@@ -1,0 +1,191 @@
+From f54dc34872120995f5dd402f09174706c4f26997 Mon Sep 17 00:00:00 2001
+From: mamingy2 <mingyang.ma@intel.com>
+Date: Thu, 30 Mar 2023 12:50:32 +0800
+Subject: [PATCH 1/4] rewrite to skip
+
+---
+ cfg/encoder_lowdelay_P_vtm.cfg            |  6 ++---
+ source/Lib/CommonLib/ContextModelling.cpp | 16 ++++++++++++
+ source/Lib/CommonLib/ContextModelling.h   |  1 +
+ source/Lib/EncoderLib/CABACWriter.cpp     | 22 ++++++++++++++++
+ source/Lib/EncoderLib/CABACWriter.h       |  2 ++
+ source/Lib/EncoderLib/EncGOP.cpp          |  4 ++-
+ source/Lib/EncoderLib/EncSlice.cpp        | 32 +++++++++++++++++++++--
+ 7 files changed, 77 insertions(+), 6 deletions(-)
+
+diff --git a/cfg/encoder_lowdelay_P_vtm.cfg b/cfg/encoder_lowdelay_P_vtm.cfg
+index f937a614..c5f297b8 100644
+--- a/cfg/encoder_lowdelay_P_vtm.cfg
++++ b/cfg/encoder_lowdelay_P_vtm.cfg
+@@ -71,7 +71,7 @@ TemporalFilterStrengthFrame8  : 0.2         # Enable filter at every 8th frame w
+ 
+ #============ Rate Control ======================
+ RateControl                         : 0                # Rate control: enable rate control
+-TargetBitrate                       : 1000000          # Rate control: target bitrate, in bps
++TargetBitrate                       : 100          # Rate control: target bitrate, in bps
+ KeepHierarchicalBit                 : 2                # Rate control: 0: equal bit allocation; 1: fixed ratio bit allocation; 2: adaptive ratio bit allocation
+ LCULevelRateControl                 : 1                # Rate control: 1: LCU level RC; 0: picture level RC
+ RCLCUSeparateModel                  : 1                # Rate control: use LCU level separate R-lambda model
+@@ -112,7 +112,7 @@ LMChroma                     : 1      # use CCLM only
+ DepQuant                     : 1
+ IMV                          : 1
+ ALF                          : 1
+-CIIP                         : 1
++CIIP                         : 0
+ IBC                          : 0      # turned off in CTC
+ AllowDisFracMMVD             : 1
+ AffineAmvr                   : 0
+@@ -133,7 +133,7 @@ FastMrg                      : 1
+ AMaxBT                       : 1
+ FastMIP                      : 0
+ FastLocalDualTreeMode        : 2
+-MaxMergeRdCandNumTotal       : 5
++# MaxMergeRdCandNumTotal       : 5
+ 
+ # Encoder optimization tools
+ AffineAmvrEncOpt             : 0
+diff --git a/source/Lib/CommonLib/ContextModelling.cpp b/source/Lib/CommonLib/ContextModelling.cpp
+index 537392c9..1027daab 100644
+--- a/source/Lib/CommonLib/ContextModelling.cpp
++++ b/source/Lib/CommonLib/ContextModelling.cpp
+@@ -340,6 +340,22 @@ unsigned DeriveCtx::CtxSkipFlag( const CodingUnit& cu )
+   return ctxId;
+ }
+ 
++unsigned DeriveCtx::CtxSkipFlag1( const CodingUnit& cu )
++{
++  const CodingStructure *cs = cu.cs;
++  unsigned ctxId = 0;
++
++  // Get BCBP of left PU
++  const CodingUnit *cuLeft = cs->getCURestricted(cu.lumaPos().offset(-1, 0), cu, ChannelType::LUMA);
++  ctxId = ( cuLeft ) ? 1 : 0;
++
++  // Get BCBP of above PU
++  const CodingUnit *cuAbove = cs->getCURestricted(cu.lumaPos().offset(0, -1), cu, ChannelType::LUMA);
++  ctxId += ( cuAbove ) ? 1 : 0;
++
++  return ctxId;
++}
++
+ unsigned DeriveCtx::CtxPredModeFlag( const CodingUnit& cu )
+ {
+   const CodingUnit *cuLeft  = cu.cs->getCURestricted(cu.lumaPos().offset(-1, 0), cu, ChannelType::LUMA);
+diff --git a/source/Lib/CommonLib/ContextModelling.h b/source/Lib/CommonLib/ContextModelling.h
+index 919aa548..7798ef69 100644
+--- a/source/Lib/CommonLib/ContextModelling.h
++++ b/source/Lib/CommonLib/ContextModelling.h
+@@ -591,6 +591,7 @@ unsigned CtxModeConsFlag( const CodingStructure& cs, Partitioner& partitioner );
+ unsigned CtxQtCbf     ( const ComponentID compID, const bool prevCbf = false, const int ispIdx = 0 );
+ unsigned CtxInterDir  ( const PredictionUnit& pu );
+ unsigned CtxSkipFlag  ( const CodingUnit& cu );
++unsigned CtxSkipFlag1 ( const CodingUnit& cu );
+ unsigned CtxAffineFlag( const CodingUnit& cu );
+ unsigned CtxPredModeFlag( const CodingUnit& cu );
+ unsigned CtxIBCFlag(const CodingUnit& cu);
+diff --git a/source/Lib/EncoderLib/CABACWriter.cpp b/source/Lib/EncoderLib/CABACWriter.cpp
+index 8efcece1..4e548c2f 100644
+--- a/source/Lib/EncoderLib/CABACWriter.cpp
++++ b/source/Lib/EncoderLib/CABACWriter.cpp
+@@ -3557,5 +3557,27 @@ void CABACWriter::codeAlfCtuAlternative( CodingStructure& cs, uint32_t ctuRsAddr
+   }
+ }
+ 
++void CABACWriter::rewrite (bool isFirCtu, CodingUnit &cu)
++{
++  if (isFirCtu) 
++  {
++    m_binEncoder.encodeBin(0, Ctx::SaoTypeIdx());
++    m_binEncoder.encodeBin(0, Ctx::SaoTypeIdx());
++  }
++  else
++    m_binEncoder.encodeBin(1, Ctx::SaoMergeFlag());
++  unsigned ctxId;
++  m_binEncoder.encodeBin(0, Ctx::SplitFlag(3));
++  //TODO: cu_skip_flag
++  ctxId = DeriveCtx::CtxSkipFlag1( cu );
++  m_binEncoder.encodeBin((cu.skip), Ctx::SkipFlag(ctxId));
++
++  // ctxId = DeriveCtx::CtxAffineFlag( cu );
++  m_binEncoder.encodeBin(0, Ctx::SubblockMergeFlag(0));
++
++  m_binEncoder.encodeBin(0, Ctx::MmvdFlag(0));
++  m_binEncoder.encodeBin(0, Ctx::MergeIdx());
++}
++
+ 
+ //! \}
+diff --git a/source/Lib/EncoderLib/CABACWriter.h b/source/Lib/EncoderLib/CABACWriter.h
+index 291f3fe8..15102d9b 100644
+--- a/source/Lib/EncoderLib/CABACWriter.h
++++ b/source/Lib/EncoderLib/CABACWriter.h
+@@ -175,6 +175,8 @@ public:
+   void codeCcAlfFilterControlIdc(uint8_t idcVal, CodingStructure &cs, const ComponentID compID, const int curIdx,
+                                  const uint8_t *filterControlIdc, Position lumaPos, const int filterCount);
+ 
++  void        rewrite (bool isFirCtu, CodingUnit &cu);
++
+ private:
+   void        unary_max_symbol          ( unsigned symbol, unsigned ctxId0, unsigned ctxIdN, unsigned maxSymbol );
+   void        unary_max_eqprob          ( unsigned symbol,                                   unsigned maxSymbol );
+diff --git a/source/Lib/EncoderLib/EncGOP.cpp b/source/Lib/EncoderLib/EncGOP.cpp
+index a52fb7a0..231fd0f5 100644
+--- a/source/Lib/EncoderLib/EncGOP.cpp
++++ b/source/Lib/EncoderLib/EncGOP.cpp
+@@ -3952,7 +3952,9 @@ void EncGOP::compressGOP(int pocLast, int numPicRcvd, PicList &rcListPic, std::l
+ #endif
+         }
+       }
+-
++      if (pcPic->getPOC() != 0) {
++        pcSlice->setAlfEnabledFlag(COMPONENT_Y, false);
++      }
+       if (pcSlice->getSPS()->getALFEnabledFlag() && (pcSlice->getAlfEnabledFlag(COMPONENT_Y) || pcSlice->getCcAlfCbEnabledFlag() || pcSlice->getCcAlfCrEnabledFlag()))
+       {
+         for (int apsId = m_pcCfg->getALFAPSIDShift(); apsId < m_pcCfg->getALFAPSIDShift() + m_pcCfg->getMaxNumALFAPS(); apsId++)
+diff --git a/source/Lib/EncoderLib/EncSlice.cpp b/source/Lib/EncoderLib/EncSlice.cpp
+index 1d10f304..44fd1189 100644
+--- a/source/Lib/EncoderLib/EncSlice.cpp
++++ b/source/Lib/EncoderLib/EncSlice.cpp
+@@ -2079,8 +2079,36 @@ void EncSlice::encodeSlice   ( Picture* pcPic, OutputBitstream* pcSubstreams, ui
+     {
+       resetBcwCodingOrder(false, cs);
+     }
+-
+-    m_CABACWriter->coding_tree_unit( cs, ctuArea, pcPic->m_prevQP, ctuRsAddr );
++    const VPS* vps = pcPic->cs->vps;
++    if (pcPic->getPOC() != 0 && vps->getGeneralLayerIdx(pcPic->layerId)) {
++      // do something with cs
++      QTBTPartitioner partitioner;
++      partitioner.initCtu(ctuArea, ChannelType::LUMA, *cs.slice);
++      CodingUnit &cu          = *cs.getCU(ctuArea.block(partitioner.chType), partitioner.chType);
++      PredictionUnit &pu      = *cu.firstPU;
++      // set the cu size as ctu
++      cu.skip = true;
++      cu.mmvdSkip = false;
++      cu.firstPU->mergeFlag = true;
++      cu.splitSeries = 0;
++      cu.depth = 0;
++      cu.block(cu.chType).size().width = 128;
++      cu.block(cu.chType).size().height = 128;
++      // std::cout << cu.block(cu.chType).size().width << cu.block(cu.chType).size().height << '\n';
++      pu.mmvdMergeFlag = false;
++      pu.mmvdMergeIdx.val = 0;
++
++      bool isFirstCtuinTile = ctuIdx == 0;
++      if (ctuIdx) {
++        isFirstCtuinTile = cs.pps->getTileIdx( ctuRsAddr ) != cs.pps->getTileIdx( pcSlice->getCtuAddrInSlice( ctuIdx - 1 ) );
++      }
++      // std::cout << "\n isFirstCtuinTile: " << isFirstCtuinTile;
++      m_CABACWriter->rewrite(isFirstCtuinTile, cu);
++    }
++    else {
++      m_CABACWriter->coding_tree_unit( cs, ctuArea, pcPic->m_prevQP, ctuRsAddr );
++    }
++    
+ 
+     // store probabilities of first CTU in line into buffer
+     if( cs.pps->ctuIsTileColBd( ctuXPosInCtus ) && wavefrontsEnabled )
+-- 
+2.17.1
+
